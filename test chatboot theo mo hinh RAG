@@ -1,0 +1,141 @@
+ 
+!pip install -q sentence-transformers
+!pip install -q faiss-cpu
+!pip install -U transformers accelerate bitsandbytes
+
+from huggingface_hub import login
+login()
+////////////////////////=============LOAD MODEL= =======================================
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+
+model_id = "Qwen/Qwen2.5-7B-Instruct"
+
+# Cấu hình 4bit đúng chuẩn mới
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_quant_type="nf4"
+)
+
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    device_map="auto",
+    quantization_config=bnb_config,
+    torch_dtype=torch.float16
+)
+
+////////////////////////////////TAO HÀM THỰC THI TẠO CÂU TRẢ LƠI===================================
+import torch
+
+def ask_question(
+    model,
+    tokenizer,
+    system_prompt: str,
+    user_prompt: str,
+    max_new_tokens: int = 320,
+    temperature: float = 0.2,
+    top_p: float = 0.9,
+    repetition_penalty: float = 1.05,
+):
+    """
+    Generate answer strictly from provided CHUNKs.
+    - Uses chat template if available.
+    - Enforces deterministic-ish output with low temperature.
+    """
+
+    # 1) Build messages (chat format)
+    messages = [
+        {"role": "system", "content": system_prompt.strip()},
+        {"role": "user", "content": user_prompt.strip()},
+    ]
+
+    # 2) Turn messages into model input
+    # Prefer tokenizer chat template (best for instruct models)
+    if hasattr(tokenizer, "apply_chat_template"):
+        prompt_text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        inputs = tokenizer(prompt_text, return_tensors="pt")
+    else:
+        # Fallback: plain concatenation
+        prompt_text = f"[SYSTEM]\n{system_prompt.strip()}\n\n[USER]\n{user_prompt.strip()}\n\n[ASSISTANT]\n"
+        inputs = tokenizer(prompt_text, return_tensors="pt")
+
+    # 3) Move to same device as model
+    device = model.device if hasattr(model, "device") else ("cuda" if torch.cuda.is_available() else "cpu")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    # 4) Generate
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=(temperature > 0),
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=getattr(tokenizer, "pad_token_id", tokenizer.eos_token_id),
+        )
+
+    # 5) Decode only the newly generated part
+    gen_ids = output_ids[0][inputs["input_ids"].shape[-1]:]
+    answer = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+
+    return answer
+//////////////////////////LÂY THÔNG TIN DỰA TRÊN CÁC THÔNG TIN ĐẦU VÀO LÀ CÂU HỎI VÀ NGỮ CẢNH =====================================
+answer = ask_question(
+    model=model,
+    tokenizer=tokenizer,
+    system_prompt=system_prompt,
+    user_prompt=user_prompt,
+    max_new_tokens=260,
+    temperature=0.1,  # thấp để bớt "bịa"
+)
+
+print(answer)
+
+ ////////////////////////TAO PROMPT ======================================================
+import torch
+
+system_prompt = """Bạn là trợ lý pháp lý chuyên về thủ tục hành chính Việt Nam.
+LUẬT BẮT BUỘC:
+1. Chỉ được trả lời dựa trên nội dung trong các CHUNK được cung cấp.
+2. Không được suy diễn ngoài nội dung.
+3. Không được sử dụng kiến thức bên ngoài.
+4. Không được giả định thêm tình tiết.
+
+YÊU CẦU TRẢ LỜI:
+- Trả lời theo dạng gạch đầu dòng.
+- Mỗi ý phải có trích dẫn nguồn ở cuối dòng theo format:
+  (doc_title – chunk_title)
+- Không viết đoạn văn dài.
+- Không thêm lời bình ngoài yêu cầu.
+"""
+
+user_prompt = """======================
+CÂU HỎI:
+Trường hợp đã ly hôn ở nước ngoài nhưng chưa ghi chú ly hôn trong Cơ sở dữ liệu hộ tịch điện tử thì có được đăng ký kết hôn tại Việt Nam không?
+======================
+NGUỒN DỮ LIỆU:
+Nhóm thủ tục: Hôn nhân và gia đình
+Lĩnh vực: Kết hôn
+Tên thủ tục hành chính: Thủ tục đăng ký kết hôn có yếu tố nước ngoài
+
+[CHUNK 1] (chunk_title = Thành phần hồ sơ, step_no = 3)
+Thành phần hồ sơ
+Bao gồm Tên giấy tờ: - Tờ khai đăng ký kết hôn theo mẫu, có đủ thông tin của hai bên nam, nữ. Hai bên nam, nữ có thể khai chung vào một Tờ khai đăng ký kết hôn (nếu người có yêu cầu lựa chọn nộp hồ sơ theo hình thức trực tiếp); Số lượng: Bản chính: 1 - Bản sao: 0. Tên giấy tờ: - Mẫu hộ tịch điện tử tương tác đăng ký kết hôn (do người yêu cầu cung cấp thông tin theo hướng dẫn trên Cổng dịch vụ công, nếu người có yêu cầu lựa chọn nộp hồ sơ theo hình thức trực tuyến). Số lượng: Bản chính: 1 - Bản sao: 0. Tên giấy tờ: - Người có yêu cầu đăng ký kết hôn thực hiện việc nộp/xuất trình (theo hình thức trực tiếp) hoặc tải lên (theo hình thức trực tuyến) các giấy tờ sau: Số lượng: Bản chính: 0 - Bản sao: 0. * Giấy tờ phải nộp: Tên giấy tờ: - Giấy xác nhận của tổ chức y tế có thẩm quyền của Việt Nam hoặc nước ngoài xác nhận các bên kết hôn không mắc bệnh tâm thần hoặc bệnh khác mà không có khả năng nhận thức, làm chủ được hành vi của mình; Số lượng: Bản chính: 1 - Bản sao: 0. Tên giấy tờ: - Giấy tờ chứng minh tình trạng hôn nhân của người nước ngoài do cơ quan có thẩm quyền của nước mà người đó là công dân cấp còn giá trị sử dụng, xác nhận hiện tại người đó không có vợ hoặc không có chồng; trường hợp nước ngoài không cấp xác nhận tình trạng hôn nhân thì thay bằng giấy tờ do cơ quan có thẩm quyền nước ngoài xác nhận người đó có đủ điều kiện kết hôn theo pháp luật nước đó. Số lượng: Bản chính: 1 - Bản sao: 0. Tên giấy tờ: Giá trị sử dụng của giấy tờ chứng minh tình trạng hôn nhân của người nước ngoài được xác định theo thời hạn ghi trên giấy tờ đó. Trường hợp giấy tờ chứng minh tình trạng hôn nhân không ghi thời hạn sử dụng thì giấy tờ này và giấy xác nhận của tổ chức y tế có giá trị trong thời hạn 06 tháng, kể từ ngày cấp. Số lượng: Bản chính: 1 - Bản sao: 0. Tên giấy tờ: - Người nước ngoài, công dân Việt Nam định cư ở nước ngoài phải nộp bản sao hộ chiếu/giấy tờ có giá trị thay thế hộ chiếu. Số lượng: Bản chính: 1 - Bản sao: 0. Tên giấy tờ: - Giấy xác nhận tình trạng hôn nhân của công dân Việt Nam cư trú trong nước. Trường hợp đã có thông tin tình trạng hôn nhân trong CSDLHTĐT, CSDLQGVDC thì không phải xuất trình (theo hình thức trực tiếp) hoặc tải lên (theo hình thức trực tuyến). Số lượng: Bản chính: 1 - Bản sao: 0. Tên giấy tờ: * Ngoài giấy tờ nêu trên, tùy từng trường hợp, bên nam, bên nữ phải nộp giấy tờ tương ứng sau đây: Số lượng: Bản chính: 1 - Bản sao: 0. Tên giấy tờ: - Công dân Việt Nam đã ly hôn hoặc hủy việc kết hôn tại cơ quan có thẩm quyền của nước ngoài phải nộp bản sao trích lục hộ tịch về việc đã ghi vào sổ việc ly hôn hoặc hủy việc kết hôn trái pháp luật (Trích lục ghi chú ly hôn); Số lượng: Bản chính: 1 - Bản sao: 0. Tên giấy tờ: - Công dân Việt Nam là công chức, viên chức hoặc đang phục vụ trong lực lượng vũ trang phải nộp văn bản của cơ quan, đơn vị quản lý xác nhận việc kết hôn với người nước ngoài không trái với quy định của ngành đó; Số lượng: Bản chính: 1 - Bản sao: 0. Tên giấy tờ: - Trường hợp người yêu cầu đăng ký kết hôn đang công tác, học tập, lao động có thời hạn ở nước ngoài thì phải nộp Giấy xác nhận tình trạng hôn nhân do Cơ quan đại diện ngoại giao, Cơ quan đại diện lãnh sự của Việt Nam ở nước ngoài cấp. Số lượng: Bản chính: 1 - Bản sao: 0. * Giấy tờ phải xuất trình: Tên giấy tờ: - Hộ chiếu/Chứng minh nhân dân/Thẻ căn cước công dân/Thẻ căn cước/Căn cước điện tử/Giấy chứng nhận căn cước hoặc các giấy tờ khác có dán ảnh và thông tin cá nhân do cơ quan có thẩm quyền cấp, còn giá trị sử dụng để chứng minh về nhân thân của công dân Việt Nam. Trường hợp các thông tin cá nhân trong các giấy tờ này đã có trong CSDLQGVDC, CSDLHTĐT, được hệ thống điền tự động thì không phải tải lên (theo hình thức trực tuyến). Số lượng: Bản chính: 1 - Bản sao: 0. Tên giấy tờ: - Người nước ngoài xuất trình bản chính hộ chiếu để chứng minh về nhân thân; trường hợp người nước ngoài không có hộ chiếu để xuất trình thì có thể xuất trình giấy tờ đi lại quốc tế hoặc thẻ cư trú. Số lượng: Bản chính: 1 - Bản sao: 0. Tên giấy tờ: - Giấy tờ có giá trị chứng minh thông tin về cư trú trong trường hợp cơ quan đăng ký hộ tịch không thể khai thác được thông tin về nơi cư trú của công dân theo các phương thức quy định tại Khoản 2 Điều 14 Nghị định số 104/2022/NĐ-CP ngày 21/12/2022 của Chính phủ. Trường hợp các thông tin về giấy tờ chứng minh nơi cư trú đã được khai thác từ Cơ sở dữ liệu quốc gia về dân cư bằng các phương thức này thì người có yêu cầu không phải xuất trình (theo hình thức trực tiếp) hoặc tải lên (theo hình thức trực tuyến). Số lượng: Bản chính: 1 - Bản sao: 0. * Lưu ý: Tên giấy tờ: - Cá nhân có quyền lựa chọn thực hiện thủ tục hành chính về hộ tịch tại cơ quan đăng ký hộ tịch nơi cư trú; nơi cư trú của cá nhân được xác định theo quy định của pháp luật về cư trú. Trường hợp cá nhân lựa chọn thực hiện thủ tục hành chính về hộ tịch không phải tại Ủy ban nhân dân cấp xã nơi thường trú hoặc nơi tạm trú thì Ủy ban nhân dân cấp xã nơi tiếp nhận yêu cầu có trách nhiệm hỗ trợ người dân nộp hồ sơ đăng ký hộ tịch trực tuyến đến đúng cơ quan có thẩm quyền theo quy định. Số lượng: Bản chính: 0 - Bản sao: 0. Tên giấy tờ: - Đối với yêu cầu đăng ký khai sinh mà cha, mẹ trẻ đã đăng ký kết hôn, trên cơ sở thông tin về Giấy chứng nhận kết hôn cung cấp trong Tờ khai đăng ký khai sinh, cơ quan đăng ký hộ tịch có trách nhiệm tra cứu thông tin về tình trạng hôn nhân của cha, mẹ trẻ trên Hệ thống thông tin giải quyết thủ tục hành chính cấp tỉnh thông qua kết nối với CSDLHTĐT, CSQGVDC. Kết quả tra cứu được lưu trữ dưới dạng điện tử hoặc bản giấy, phản ánh đầy đủ, chính xác thông tin tại thời điểm tra cứu và đính kèm hồ sơ của người đăng ký. Trường hợp không tra cứu được tình trạng hôn nhân do chưa có thông tin trong CSDLHTĐT, CSQGVDC, thì cơ quan đăng ký hộ tịch đề nghị Ủy ban nhân dân cấp xã nơi người yêu cầu thường trú/nơi đã đăng ký kết hôn xác minh, cung cấp thông tin. Trong thời hạn 03 ngày làm việc kể từ ngày nhận được yêu cầu xác minh, Ủy ban nhân dân cấp xã nơi nhận được đề nghị xác minh có trách nhiệm kiểm tra, xác minh và gửi kết quả về tình trạng hôn nhân của người đó. Số lượng: Bản chính: 0 - Bản sao: 0. Tên giấy tờ: - Nếu bên kết hôn là công dân Việt Nam đã ly hôn hoặc hủy việc kết hôn tại cơ quan có thẩm quyền nước ngoài nhưng qua tra cứu thông tin trong Cơ sở dữ liệu hộ tịch điện tử; thông qua kết nối giữa Hệ thống thông tin giải quyết thủ tục hành chính cấp tỉnh với Cơ sở dữ liệu hộ tịch điện tử, Cơ sở dữ liệu quốc gia về dân cư không thể hiện thông tin về việc đã ghi chú ly hôn, hủy việc kết hôn thì cơ quan đăng ký hộ tịch hướng dẫn công dân thực hiện thủ tục ghi vào sổ hộ tịch việc ly hôn/hủy việc kết hôn tại cơ quan nhà nước có thẩm quyền trước khi giải quyết việc đăng ký kết hôn. Số lượng: Bản chính: 0 - Bản sao: 0. Tên giấy tờ: - Đối với giấy tờ nộp, xuất trình nếu người yêu cầu nộp hồ sơ theo hình thức trực tiếp: Số lượng: Bản chính: 0 - Bản sao: 0. Tên giấy tờ: + Người yêu cầu đăng ký hộ tịch có thể nộp bản sao được chứng thực từ bản chính hoặc bản sao được cấp từ sổ gốc (sau đây gọi là bản sao) hoặc bản chụp kèm theo bản chính, bản điện tử các giấy tờ này, bao gồm cả giấy tờ được tích hợp, hiển thị trên Ứng dụng định danh điện tử (VneID). Số lượng: Bản chính: 0 - Bản sao: 0. Tên giấy tờ: Trường hợp người yêu cầu nộp bản chụp kèm theo bản chính giấy tờ thì người tiếp nhận có trách nhiệm kiểm tra, đối chiếu bản chụp với bản chính và ký xác nhận, không được yêu cầu nộp bản sao giấy tờ đó. Số lượng: Bản chính: 0 - Bản sao: 0. Tên giấy tờ: + Đối với giấy tờ xuất trình khi đăng ký hộ tịch, người tiếp nhận có trách nhiệm kiểm tra, đối chiếu với thông tin trong tờ khai, chụp lại hoặc ghi lại thông tin để lưu trong hồ sơ và trả lại cho người xuất trình, không được yêu cầu nộp bản sao hoặc bản chụp giấy tờ đó. Số lượng: Bản chính: 0 - Bản sao: 0. Tên giấy tờ: + Người tiếp nhận có trách nhiệm tiếp nhận đúng, đủ hồ sơ đăng ký hộ tịch theo quy định của pháp luật hộ tịch, không được yêu cầu người đăng ký hộ tịch nộp thêm giấy tờ mà pháp luật hộ tịch không quy định phải nộp. Số lượng: Bản chính: 0 - Bản sao: 0. Tên giấy tờ: + Người tiếp nhận hồ sơ thực hiện khai thác thông tin trong CSDLQGVDC theo quy định pháp luật nếu người yêu cầu đăng ký hộ tịch đã cung cấp họ, chữ đệm, tên; ngày, tháng, năm sinh; số định danh cá nhân/thẻ căn cước công dân/thẻ căn cước/căn cước điện tử. Trường hợp các thông tin cần khai thác không có trong CSDLQGVDC thì đề nghị người yêu cầu kê khai đầy đủ. Số lượng: Bản chính: 0 - Bản sao: 0. Tên giấy tờ: - Đối với giấy tờ gửi kèm theo nếu người yêu cầu nộp hồ sơ theo hình thức trực tuyến: Số lượng: Bản chính: 0 - Bản sao: 0. Tên giấy tờ: + Bản chụp các giấy tờ gửi kèm theo hồ sơ đăng ký kết hôn trực tuyến phải bảo đảm rõ nét, đầy đủ, toàn vẹn về nội dung, là bản chụp bằng máy ảnh, điện thoại hoặc được chụp, được quét bằng thiết bị điện tử, từ giấy tờ được cấp hợp lệ, còn giá trị sử dụng. Số lượng: Bản chính: 0 - Bản sao: 0. Tên giấy tờ: + Trường hợp giấy tờ, tài liệu phải gửi kèm trong hồ sơ đăng ký kết hôn trực tuyến đã có bản sao điện tử hoặc đã có bản điện tử giấy tờ hộ tịch thì người yêu cầu được sử dụng bản điện tử này. Số lượng: Bản chính: 0 - Bản sao: 0. Tên giấy tờ: + Khi đến cơ quan đăng ký hộ tịch nhận kết quả (Giấy chứng nhận kết hôn), người có yêu cầu đăng ký kết hôn phải nộp giấy tờ chứng minh tình trạng hôn nhân (đối với người nước ngoài), giấy xác nhận của tổ chức y tế. Số lượng: Bản chính: 0 - Bản sao: 0. Tên giấy tờ: - Giấy tờ do cơ quan có thẩm quyền của nước ngoài cấp, công chứng hoặc xác nhận để sử dụng cho việc đăng ký hộ tịch tại Việt Nam phải được hợp pháp hóa lãnh sự theo quy định của pháp luật, trừ trường hợp được miễn theo điều ước quốc tế mà Việt Nam là thành viên. Số lượng: Bản chính: 0 - Bản sao: 0. Tên giấy tờ: - Trường hợp người yêu cầu đăng ký kết hôn không cung cấp được giấy tờ nêu trên theo quy định hoặc giấy tờ nộp, xuất trình bị tẩy xóa, sửa chữa, làm giả thì cơ quan đăng ký hộ tịch có thẩm quyền hủy bỏ kết quả đăng ký kết hôn. Số lượng: Bản chính: 0 - Bản sao: 0.
+[CHUNK 2] (chunk_title = Yêu cầu, điều kiện thực hiện, step_no = 5)
+Yêu cầu, điều kiện thực hiện
+- Nam từ đủ 20 tuổi trở lên, nữ từ đủ 18 tuổi trở lên; - Việc kết hôn do nam và nữ tự nguyện quyết định; - Các bên không bị mất năng lực hành vi dân sự; - Công dân Việt Nam định cư ở nước ngoài phải có giấy tờ cho phép cư trú do cơ quan có thẩm quyền nước ngoài cấp. - Việc kết hôn không thuộc một trong các trường hợp cấm kết hôn theo quy định tại các Điểm a, b, c và d Khoản 2 Điều 5 của Luật Hôn nhân và gia đình, gồm: + Kết hôn giả tạo; + Tảo hôn, cưỡng ép kết hôn, lừa dối kết hôn, cản trở kết hôn; + Người đang có vợ, có chồng mà kết hôn với người khác hoặc chưa có vợ, chưa có chồng mà kết hôn với người đang có chồng, có vợ; + Kết hôn giữa những người cùng dòng máu về trực hệ; giữa những người có họ trong phạm vi ba đời; giữa cha, mẹ nuôi với con nuôi; giữa người đã từng là cha, mẹ nuôi với con nuôi, cha chồng với con dâu, mẹ vợ với con rể, cha dượng với con riêng của vợ, mẹ kế với con riêng của chồng. * Nhà nước không thừa nhận hôn nhân giữa những người cùng giới tính.
+[YÊU CẦU] Trả lời chỉ dựa trên nội dung các CHUNK ở trên.
+======================
+Hãy trả lời đúng theo LUẬT và YÊU CẦU TRẢ LỜI đã nêu.
+"""
+
